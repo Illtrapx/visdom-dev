@@ -303,6 +303,54 @@ def test_suspending_a_workspace_through_the_form_actually_saves(admin_client):
     assert admin_client.staff_db.get(Workspace, workspace.id).is_active is False
 
 
+def _suspending_the_form(admin_client, monkeypatch):
+    """Make the call the console is expected to make visible to a test."""
+    closed = []
+    monkeypatch.setattr(
+        panel.activity,
+        "evict_workspace",
+        lambda slug, reason=None, timeout=None: closed.append(slug) or 1,
+    )
+    return closed
+
+
+def test_suspending_a_workspace_through_the_form_closes_its_open_sockets(admin_client, monkeypatch):
+    """Refusing new requests is not the whole of a suspension.
+
+    An instance stops serving a suspended workspace at its next resolve, but a
+    tab that already has it open keeps its socket and is never asked again. The
+    console has to close those, and the only place it knows a workspace was
+    just suspended is this save.
+    """
+    closed = _suspending_the_form(admin_client, monkeypatch)
+    workspace = Workspace(id=uuid.uuid4(), name="Loud", slug="loud-one", is_active=True)
+    admin_client.staff_db.add(workspace)
+    admin_client.staff_db.commit()
+
+    saved = admin_client.post(
+        f"/admin/workspace/edit/{workspace.id}",
+        data={"is_active": "false"},
+        follow_redirects=False,
+    )
+    assert saved.status_code in (302, 303), saved.text
+    assert closed == ["loud-one"]
+
+
+def test_a_save_that_leaves_a_workspace_active_closes_nothing(admin_client, monkeypatch):
+    closed = _suspending_the_form(admin_client, monkeypatch)
+    workspace = Workspace(id=uuid.uuid4(), name="Quiet", slug="quiet-one", is_active=True)
+    admin_client.staff_db.add(workspace)
+    admin_client.staff_db.commit()
+
+    saved = admin_client.post(
+        f"/admin/workspace/edit/{workspace.id}",
+        data={"is_active": "true"},
+        follow_redirects=False,
+    )
+    assert saved.status_code in (302, 303), saved.text
+    assert closed == []
+
+
 def _account(db, email="locked-out@example.com", password="their-own-password"):
     from app.models import User
     from app.security import get_password_hash

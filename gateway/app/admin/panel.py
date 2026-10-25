@@ -6,6 +6,7 @@
 
 """The staff admin panel, mounted on its own route with its own login."""
 
+import asyncio
 import base64
 import functools
 import logging
@@ -553,6 +554,37 @@ class WorkspaceAdmin(ChangeableView, model=Workspace):
     async def get_object_for_details(self, request: Request):
         await activity.refresh_activity()
         return await super().get_object_for_details(request)
+
+    async def on_model_change(
+        self, data: dict, model, is_created: bool, request: Request
+    ) -> None:
+        """Note whether this is the save that suspends the workspace.
+
+        The row reads as inactive by the time ``after_model_change`` runs, so
+        the answer has to be taken here, while it still holds the old value.
+        """
+        await super().on_model_change(data, model, is_created, request)
+        request.state.workspace_was_active = model.is_active
+
+    async def after_model_change(
+        self, data: dict, model, is_created: bool, request: Request
+    ) -> None:
+        """Close the sockets a workspace had open when it is suspended.
+
+        Refusing a suspended workspace happens at resolve time, which leaves a
+        tab that already holds a socket free to keep writing through it. The
+        instances can close those sockets, and a suspension saved here is the
+        only place the gateway hears about one without waiting for the resolve
+        cache to expire. Best effort: the refusal is what withdraws the
+        workspace, so an instance that cannot be reached costs promptness.
+        """
+        if is_created or not getattr(request.state, "workspace_was_active", False):
+            return
+        if model.is_active:
+            return
+        await asyncio.to_thread(
+            activity.evict_workspace, model.slug, "this workspace has been suspended"
+        )
 
 
 def _other_active_admins(db, membership):
