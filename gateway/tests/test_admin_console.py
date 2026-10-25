@@ -1,6 +1,8 @@
 # Copyright 2017-present, The Visdom Authors
 """What staff can do from the console: suspend, manage memberships and staff
 accounts, set a password, hand out permissions, and read the audit trail."""
+import threading
+import time
 import uuid
 
 import pytest
@@ -314,6 +316,14 @@ def _suspending_the_form(admin_client, monkeypatch):
     return closed
 
 
+def _evictions_settled(closed):
+    """The console asks for the eviction in the background, so give it a moment."""
+    deadline = time.monotonic() + 5
+    while not closed and time.monotonic() < deadline:
+        time.sleep(0.01)
+    return closed
+
+
 def test_suspending_a_workspace_through_the_form_closes_its_open_sockets(admin_client, monkeypatch):
     """Refusing new requests is not the whole of a suspension.
 
@@ -333,7 +343,39 @@ def test_suspending_a_workspace_through_the_form_closes_its_open_sockets(admin_c
         follow_redirects=False,
     )
     assert saved.status_code in (302, 303), saved.text
-    assert closed == ["loud-one"]
+    assert _evictions_settled(closed) == ["loud-one"]
+
+
+def test_a_suspension_save_does_not_wait_for_an_instance(admin_client, monkeypatch):
+    """The save asks for the eviction and returns: a slow instance costs
+    promptness, not a stalled admin POST."""
+    started = threading.Event()
+    release = threading.Event()
+
+    def slow_evict(slug, reason=None, timeout=None):
+        started.set()
+        release.wait(10)
+        return 1
+
+    monkeypatch.setattr(panel.activity, "evict_workspace", slow_evict)
+    workspace = Workspace(id=uuid.uuid4(), name="Stuck", slug="stuck-one", is_active=True)
+    admin_client.staff_db.add(workspace)
+    admin_client.staff_db.commit()
+
+    try:
+        began = time.monotonic()
+        saved = admin_client.post(
+            f"/admin/workspace/edit/{workspace.id}",
+            data={"is_active": "false"},
+            follow_redirects=False,
+        )
+        waited = time.monotonic() - began
+    finally:
+        release.set()
+
+    assert saved.status_code in (302, 303), saved.text
+    assert waited < 2.0, f"the save waited {waited:.1f}s for the instance"
+    assert started.wait(5), "the eviction was never asked for"
 
 
 def test_a_save_that_leaves_a_workspace_active_closes_nothing(admin_client, monkeypatch):

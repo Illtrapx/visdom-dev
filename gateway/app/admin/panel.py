@@ -472,6 +472,20 @@ def _workspace_standing(model, name):
     return "active" if model.is_active else "suspended"
 
 
+# Evictions are handed to the loop and not waited for: the save must not sit
+# there while a slow instance runs into its timeout. The tasks are kept in a set
+# because the loop only holds a weak reference to a running task, and one that
+# is collected before it runs would leave the sockets open.
+_evictions: set[asyncio.Task] = set()
+
+
+def _evict_in_background(slug: str, reason: str) -> None:
+    """Ask the instances to drop a workspace's sockets, without waiting for them."""
+    task = asyncio.create_task(asyncio.to_thread(activity.evict_workspace, slug, reason))
+    _evictions.add(task)
+    task.add_done_callback(_evictions.discard)
+
+
 class WorkspaceAdmin(ChangeableView, model=Workspace):
     name = "Workspace"
     name_plural = "Workspaces"
@@ -576,15 +590,15 @@ class WorkspaceAdmin(ChangeableView, model=Workspace):
         instances can close those sockets, and a suspension saved here is the
         only place the gateway hears about one without waiting for the resolve
         cache to expire. Best effort: the refusal is what withdraws the
-        workspace, so an instance that cannot be reached costs promptness.
+        workspace, so an instance that cannot be reached costs promptness
+        rather than correctness, and the save is not held open while the
+        instances are asked.
         """
         if is_created or not getattr(request.state, "workspace_was_active", False):
             return
         if model.is_active:
             return
-        await asyncio.to_thread(
-            activity.evict_workspace, model.slug, "this workspace has been suspended"
-        )
+        _evict_in_background(model.slug, "this workspace has been suspended")
 
 
 def _other_active_admins(db, membership):
