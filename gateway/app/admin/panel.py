@@ -480,10 +480,26 @@ _evictions: set[asyncio.Task] = set()
 
 
 def _evict_in_background(slug: str, reason: str) -> None:
-    """Ask the instances to drop a workspace's sockets, without waiting for them."""
+    """Ask the instances to drop a workspace's sockets, without waiting for them.
+
+    Nothing is left waiting on the task, so a failure has no caller to raise
+    into: the done callback writes it down, or the only trace is the loop's own
+    "Task exception was never retrieved" line.
+    """
     task = asyncio.create_task(asyncio.to_thread(activity.evict_workspace, slug, reason))
     _evictions.add(task)
-    task.add_done_callback(_evictions.discard)
+
+    def _settle(finished: asyncio.Task) -> None:
+        _evictions.discard(finished)
+        if finished.cancelled():
+            return
+        failure = finished.exception()
+        if failure is not None:
+            logging.warning(
+                "could not evict the sockets of %s: %s", slug, failure, exc_info=failure
+            )
+
+    task.add_done_callback(_settle)
 
 
 class WorkspaceAdmin(ChangeableView, model=Workspace):

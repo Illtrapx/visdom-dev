@@ -1,6 +1,7 @@
 # Copyright 2017-present, The Visdom Authors
 """What staff can do from the console: suspend, manage memberships and staff
 accounts, set a password, hand out permissions, and read the audit trail."""
+import logging
 import threading
 import time
 import uuid
@@ -376,6 +377,37 @@ def test_a_suspension_save_does_not_wait_for_an_instance(admin_client, monkeypat
     assert saved.status_code in (302, 303), saved.text
     assert waited < 2.0, f"the save waited {waited:.1f}s for the instance"
     assert started.wait(5), "the eviction was never asked for"
+
+
+def test_an_eviction_that_fails_is_written_down(admin_client, monkeypatch, caplog):
+    """Nothing waits on the eviction, so a failure has no caller to raise into.
+
+    Left alone it surfaces as the loop's own "Task exception was never
+    retrieved" line, which does not say which workspace it was for. The done
+    callback is the only place that still knows.
+    """
+
+    def broken_evict(slug, reason=None, timeout=None):
+        raise RuntimeError("the instance refused the eviction")
+
+    monkeypatch.setattr(panel.activity, "evict_workspace", broken_evict)
+    workspace = Workspace(id=uuid.uuid4(), name="Broken", slug="broken-one", is_active=True)
+    admin_client.staff_db.add(workspace)
+    admin_client.staff_db.commit()
+
+    with caplog.at_level(logging.WARNING):
+        saved = admin_client.post(
+            f"/admin/workspace/edit/{workspace.id}",
+            data={"is_active": "false"},
+            follow_redirects=False,
+        )
+        assert saved.status_code in (302, 303), saved.text
+        deadline = time.monotonic() + 5
+        while not caplog.records and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+    lines = [record.getMessage() for record in caplog.records]
+    assert any("broken-one" in line for line in lines), lines
 
 
 def test_a_save_that_leaves_a_workspace_active_closes_nothing(admin_client, monkeypatch):
